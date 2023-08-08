@@ -28,6 +28,8 @@ class Ad(Base):
     payments_in_year: Mapped[Optional[int]]
     furniture_info: Mapped[Optional[str]]
     images: Mapped[List["Image"]] = relationship(back_populates="ad")
+    nearest_station: Mapped[str]
+    distance_to_station_km: Mapped[float]
 
 
 class Image(Base):

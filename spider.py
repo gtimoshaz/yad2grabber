@@ -45,6 +45,7 @@ class AdsDownloader:
         self.engine = create_async_engine("sqlite+aiosqlite:///base.sqlite3", echo=True)
         self.session_maker = async_sessionmaker(bind=self.engine,
                                                 expire_on_commit=False)
+        self.db_semaphore = asyncio.Semaphore(1)
 
     async def fetch_json(self, url) -> dict:
         async with self.sem:
@@ -65,10 +66,11 @@ class AdsDownloader:
         data, status = await self.fetch_bytes(url)
         if status == 200:
             im = Image(ad_id=ad_id, data=data, id=uuid.uuid4())
-            async with self.session_maker() as session:
-                async with session.begin():
-                    session.add(im)
-                    await session.commit()
+            async with self.db_semaphore:
+                async with self.session_maker() as session:
+                    async with session.begin():
+                        session.add(im)
+                        await session.commit()
         else:
             pass
 
@@ -96,31 +98,37 @@ class AdsDownloader:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self.download_images(ad_id, urls))
             more_info = await self.fetch_json(f"https://gw.yad2.co.il/feed-search-legacy/item?token={ad_id}")
-            more_data = more_info["data"]
-            async with self.session_maker() as session:
-                async with session.begin():
-                    ad = Ad(
-                        id=ad_id,
-                        lon=apartment_json["coordinates"]["longitude"],
-                        lat=apartment_json["coordinates"]["latitude"],
-                        city=apartment_json["city"],
-                        info_text=more_data["info_text"],
-                        info_title=more_data["info_title"],
-                        main_title=more_data["main_title"],
-                        price=price,
-                        HouseCommittee=AdsDownloader.int_price(more_data["HouseCommittee"]),
-                        property_tax=AdsDownloader.int_price(more_data["property_tax"]),
-                        payments_in_year=AdsDownloader.int_price(more_data["payments_in_year"]),
-                        furniture_info=more_data["furniture_info"]
-                    )
-                    session.add(ad)
-                    try:
-                        await session.commit()
-                    except sqlite3.IntegrityError:
-                        await session.rollback()
-                    except sqlalchemy.exc.IntegrityError:
-                        await session.rollback()
-
+            more_data: dict = more_info["data"]
+            lon = apartment_json["coordinates"]["longitude"]
+            lat = apartment_json["coordinates"]["latitude"]
+            station, distance = self.closest((lat, lon))
+            async with self.db_semaphore:
+                async with self.session_maker() as session:
+                    async with session.begin():
+                        ad = Ad(
+                            id=ad_id,
+                            lon=lon,
+                            lat=lat,
+                            city=apartment_json["city"],
+                            info_text=more_data["info_text"],
+                            info_title=more_data["info_title"],
+                            main_title=more_data["main_title"],
+                            price=price,
+                            HouseCommittee=AdsDownloader.int_price(more_data["HouseCommittee"]),
+                            property_tax=AdsDownloader.int_price(more_data["property_tax"]),
+                            payments_in_year=AdsDownloader.int_price(more_data["payments_in_year"]),
+                            furniture_info=more_data["furniture_info"],
+                            street=more_data.get("street"),
+                            nearest_station=station,
+                            distance_to_station_km=distance
+                        )
+                        session.add(ad)
+                        try:
+                            await session.commit()
+                        except sqlite3.IntegrityError:
+                            await session.rollback()
+                        except sqlalchemy.exc.IntegrityError:
+                            await session.rollback()
 
     def closest(self, coordinates: (float, float)):
         nearest_station = None
