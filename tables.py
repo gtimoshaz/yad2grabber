@@ -1,8 +1,10 @@
+import uuid
+
 import sqlalchemy
 from typing import Optional, List
 
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import ForeignKey, LargeBinary
+from sqlalchemy import ForeignKey, LargeBinary, Uuid
 
 
 class Base(DeclarativeBase):
@@ -13,6 +15,7 @@ class Ad(Base):
     __tablename__ = "ad"
 
     id: Mapped[str] = mapped_column(primary_key=True)
+    price: Mapped[int]
     lat: Mapped[float]
     lon: Mapped[float]
     city: Mapped[str]
@@ -30,10 +33,7 @@ class Ad(Base):
 class Image(Base):
     __tablename__ = "images"
 
-    id: Mapped[str] = mapped_column(primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     ad_id: Mapped[str] = mapped_column(ForeignKey("ad.id"))
     ad: Mapped["Ad"] = relationship(back_populates="images")
     data: Mapped[bytes]
-
-
-Base.metadata.create_all()

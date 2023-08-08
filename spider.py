@@ -23,49 +23,104 @@
 #    url: str
 #    data: varbinary
 import asyncio, aiohttp
-import json
+from aiohttp_retry import RetryClient, ExponentialRetry
+import re
+import uuid
 
 import pandas as pd
 from geopy.distance import geodesic
+import sqlalchemy.exc
+import sqlite3
 
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from tables import Ad, Image, Base
 
 
 class AdsDownloader:
     def __init__(self, session, jobs=10, stations_csv="stations.csv"):
-        self.session = session
+        self.aiohttp_session = session
         self.sem = asyncio.Semaphore(jobs)
         self.stations_df = pd.read_csv(stations_csv)
-    async def fetch(self, url) -> aiohttp.ClientResponse:
-        async with self.sem:
-            resp = await self.session.get(url)
-            return resp
+        self.engine = create_async_engine("sqlite+aiosqlite:///base.sqlite3", echo=True)
+        self.session_maker = async_sessionmaker(bind=self.engine,
+                                                expire_on_commit=False)
 
-    async def download_image_to_db(ad_id: str, url: str):
-        resp = await downloader.fetch(url)
-        if resp.status == 200:
-            data = await resp.read()
-            im = Image(ad_id=ad_id, data=data)
-            #await conn.execute()
+    async def fetch_json(self, url) -> dict:
+        async with self.sem:
+            retry_params = ExponentialRetry(attempts=5, start_timeout=1)
+            retry_session = RetryClient(client_session=self.aiohttp_session, retry_options=retry_params)
+            await asyncio.sleep(0.05)
+            async with retry_session.get(url) as resp:
+                js = await resp.json()
+            return js
+
+    async def fetch_bytes(self, url) -> (bytes, int):
+        async with self.sem:
+            async with self.aiohttp_session.get(url) as resp:
+                content = await resp.read()
+        return content, resp.status
+
+    async def download_image_to_db(self, ad_id: str, url: str):
+        data, status = await self.fetch_bytes(url)
+        if status == 200:
+            im = Image(ad_id=ad_id, data=data, id=uuid.uuid4())
+            async with self.session_maker() as session:
+                async with session.begin():
+                    session.add(im)
+                    await session.commit()
         else:
             pass
-        resp.close()
 
     async def download_images(self, ad_id: str, urls: [str]):
         async with asyncio.TaskGroup() as tg:
             for url in urls:
-                tg.create_task(download_image_to_db(ad_id, url, downloader, conn))
+                tg.create_task(self.download_image_to_db(ad_id, url))
+
+    @staticmethod
+    def int_price(price: str | int) -> int | None:
+        if isinstance(price, int):
+            return price
+        if "לא" in price or "גמיש" in price:
+            return None
+        else:
+            # Remove the currency symbol and commas, then convert to an integer
+            return int(re.sub(r'[^\d]', '', price))
 
     async def download_apartment(self, apartment_json: dict):
         ad_id = apartment_json["id"]
         urls = apartment_json["images_urls"]
+        price = AdsDownloader.int_price(apartment_json["price"])
+        if price is None:
+            return
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self.download_images(ad_id, urls))
-            more_info = await downloader.fetch(f"https://gw.yad2.co.il/feed-search-legacy/item?token={ad_id}")
-            more_info_json = await more_info.json()
-            # TODO write everything to db
+            more_info = await self.fetch_json(f"https://gw.yad2.co.il/feed-search-legacy/item?token={ad_id}")
+            more_data = more_info["data"]
+            async with self.session_maker() as session:
+                async with session.begin():
+                    ad = Ad(
+                        id=ad_id,
+                        lon=apartment_json["coordinates"]["longitude"],
+                        lat=apartment_json["coordinates"]["latitude"],
+                        city=apartment_json["city"],
+                        info_text=more_data["info_text"],
+                        info_title=more_data["info_title"],
+                        main_title=more_data["main_title"],
+                        price=price,
+                        HouseCommittee=AdsDownloader.int_price(more_data["HouseCommittee"]),
+                        property_tax=AdsDownloader.int_price(more_data["property_tax"]),
+                        payments_in_year=AdsDownloader.int_price(more_data["payments_in_year"]),
+                        furniture_info=more_data["furniture_info"]
+                    )
+                    session.add(ad)
+                    try:
+                        await session.commit()
+                    except sqlite3.IntegrityError:
+                        await session.rollback()
+                    except sqlalchemy.exc.IntegrityError:
+                        await session.rollback()
+
 
     def closest(self, coordinates: (float, float)):
         nearest_station = None
@@ -92,37 +147,32 @@ class AdsDownloader:
                 if "latitude" not in apartment["coordinates"]:
                     continue
                 coordinates = apartment["coordinates"]
-                station, dist = stationsFinder.closest((coordinates["latitude"], coordinates["longitude"]))
+                station, dist = self.closest((coordinates["latitude"], coordinates["longitude"]))
                 if dist > 1:
                     continue
-                tg.create_task(download_apartment(apartment, downloader, conn))
-                # TODO write apartment info to db
-
+                tg.create_task(self.download_apartment(apartment))
 
     async def download_all_pages(self):
-        async def download_parse_page(page_number, downloader):
-            page = await downloader.fetch(
+        async def download_parse_page(page_number):
+            page = await self.fetch_json(
                     f"https://gw.yad2.co.il/feed-search-legacy/realestate/rent?price=-1-2000&propertyGroup=apartments"
                     f"&airConditioner=1&longTerm=1&page={page_number}&forceLdLoad=true")
-            page_json = json.loads(await page.text())
-            page.close()
-            await download_apartments_from_page(page_json, downloader, conn)
-            return page_json
 
-        async with aiohttp.ClientSession() as session:
-            downloader = Downloader(session)
-            first_page = await download_parse_page(1, downloader)
-            pages = first_page["data"]["pagination"]["last_page"]
-            async with asyncio.TaskGroup() as tg:
-                for i in range(2, pages + 1):
-                    tg.create_task(download_parse_page(i, downloader))
+            await self.download_apartments_from_page(page)
+            return page
+
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        first_page = await download_parse_page(1)
+        pages = first_page["data"]["pagination"]["last_page"]
+        async with asyncio.TaskGroup() as tg:
+            for i in range(2, pages + 1):
+                tg.create_task(download_parse_page(i))
 
 
 async def async_main():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await download_all_pages(conn)
+    async with aiohttp.ClientSession() as session:
+        downloader = AdsDownloader(session)
+        await downloader.download_all_pages()
 
-
-engine = create_async_engine("sqlite+aiosqlite:///base.sqlite3", echo=True)
 asyncio.run(async_main())
